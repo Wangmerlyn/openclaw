@@ -323,12 +323,12 @@ async function runCommandHandler(handler: (args: unknown) => Promise<void>) {
   return { respond, ack };
 }
 
-function expectArgMenuLayout(respond: ReturnType<typeof vi.fn>): {
+function expectArgMenuLayout(postEphemeral: ReturnType<typeof vi.fn>): {
   type: string;
   elements?: Array<{ type?: string; action_id?: string; confirm?: unknown }>;
 } {
-  expect(respond).toHaveBeenCalledTimes(1);
-  const payload = respond.mock.calls[0]?.[0] as { blocks?: Array<{ type: string }> };
+  expect(postEphemeral).toHaveBeenCalledTimes(1);
+  const payload = postEphemeral.mock.calls[0]?.[0] as { blocks?: Array<{ type: string }> };
   expect(payload.blocks?.[0]?.type).toBe("header");
   expect(payload.blocks?.[1]?.type).toBe("section");
   expect(payload.blocks?.[2]?.type).toBe("context");
@@ -347,21 +347,24 @@ type ActionsBlockPayload = {
 
 async function runCommandAndResolveActionsBlock(
   handler: (args: unknown) => Promise<void>,
+  postEphemeral: ReturnType<typeof vi.fn>,
 ): Promise<{
-  respond: ReturnType<typeof vi.fn>;
   payload: ActionsBlockPayload;
   blockId?: string;
 }> {
-  const { respond } = await runCommandHandler(handler);
-  const payload = respond.mock.calls[0]?.[0] as ActionsBlockPayload;
+  await runCommandHandler(handler);
+  const payload = postEphemeral.mock.calls[0]?.[0] as ActionsBlockPayload;
   const blockId = payload.blocks?.find((block) => block.type === "actions")?.block_id;
-  return { respond, payload, blockId };
+  return { payload, blockId };
 }
 
-async function getFirstActionElementFromCommand(handler: (args: unknown) => Promise<void>) {
-  const { respond } = await runCommandHandler(handler);
-  expect(respond).toHaveBeenCalledTimes(1);
-  const payload = respond.mock.calls[0]?.[0] as { blocks?: Array<{ type: string }> };
+async function getFirstActionElementFromCommand(
+  handler: (args: unknown) => Promise<void>,
+  postEphemeral: ReturnType<typeof vi.fn>,
+) {
+  await runCommandHandler(handler);
+  expect(postEphemeral).toHaveBeenCalledTimes(1);
+  const payload = postEphemeral.mock.calls[0]?.[0] as { blocks?: Array<{ type: string }> };
   const actions = findFirstActionsBlock(payload);
   return actions?.elements?.[0];
 }
@@ -500,49 +503,57 @@ describe("Slack native command argument menus", () => {
       ack,
       respond,
     });
-    expect(respond).toHaveBeenCalledTimes(1);
-    const payload = respond.mock.calls[0]?.[0] as { blocks?: Array<{ type: string }> };
+    expect(postEphemeral).toHaveBeenCalledTimes(1);
+    const payload = postEphemeral.mock.calls[0]?.[0] as { blocks?: Array<{ type: string }> };
     const actionsBlock = findFirstActionsBlock(payload);
     // Should be static_select (fallback) not external_select
     expect(actionsBlock?.elements?.[0]?.type).toBe("static_select");
   });
 
   it("shows a button menu when required args are omitted", async () => {
-    const { respond } = await runCommandHandler(usageHandler);
-    const actions = expectArgMenuLayout(respond);
+    await runCommandHandler(usageHandler);
+    const actions = expectArgMenuLayout(harness.postEphemeral);
     const elementType = actions?.elements?.[0]?.type;
     expect(elementType).toBe("button");
     expect(actions?.elements?.[0]?.confirm).toBeTruthy();
   });
 
   it("shows a static_select menu when choices exceed button row size", async () => {
-    const { respond } = await runCommandHandler(reportHandler);
-    const actions = expectArgMenuLayout(respond);
+    await runCommandHandler(reportHandler);
+    const actions = expectArgMenuLayout(harness.postEphemeral);
     const element = actions?.elements?.[0];
     expect(element?.type).toBe("static_select");
-    expect(element?.action_id).toBe("openclaw_cmdarg");
+    expect(element?.action_id).toBe("openclaw_cmdarg_0");
     expect(element?.confirm).toBeTruthy();
   });
 
   it("falls back to buttons when static_select value limit would be exceeded", async () => {
-    const firstElement = await getFirstActionElementFromCommand(reportLongHandler);
+    const firstElement = await getFirstActionElementFromCommand(
+      reportLongHandler,
+      harness.postEphemeral,
+    );
     expect(firstElement?.type).toBe("button");
     expect(firstElement?.confirm).toBeTruthy();
   });
 
   it("shows an overflow menu when choices fit compact range", async () => {
-    const element = await getFirstActionElementFromCommand(reportCompactHandler);
+    const element = await getFirstActionElementFromCommand(
+      reportCompactHandler,
+      harness.postEphemeral,
+    );
     expect(element?.type).toBe("overflow");
     expect(element?.action_id).toBe("openclaw_cmdarg");
     expect(element?.confirm).toBeTruthy();
   });
 
-  it("escapes mrkdwn characters in confirm dialog text", async () => {
-    const element = (await getFirstActionElementFromCommand(unsafeConfirmHandler)) as
-      | { confirm?: { text?: { text?: string } } }
-      | undefined;
+  it("uses plain_text confirm dialogs for command arg menus", async () => {
+    const element = (await getFirstActionElementFromCommand(
+      unsafeConfirmHandler,
+      harness.postEphemeral,
+    )) as { confirm?: { text?: { type?: string; text?: string } } } | undefined;
+    expect(element?.confirm?.text?.type).toBe("plain_text");
     expect(element?.confirm?.text?.text).toContain(
-      "Run */unsafeconfirm* with *mode\\_\\*\\`\\~&lt;&amp;&gt;* set to this value?",
+      "Run /unsafeconfirm with mode_*`~<&> set to this value?",
     );
   });
 
@@ -593,10 +604,12 @@ describe("Slack native command argument menus", () => {
   });
 
   it("shows an external_select menu when choices exceed static_select options max", async () => {
-    const { respond, payload, blockId } =
-      await runCommandAndResolveActionsBlock(reportExternalHandler);
+    const { payload, blockId } = await runCommandAndResolveActionsBlock(
+      reportExternalHandler,
+      harness.postEphemeral,
+    );
 
-    expect(respond).toHaveBeenCalledTimes(1);
+    expect(harness.postEphemeral).toHaveBeenCalledTimes(1);
     const actions = findFirstActionsBlock(payload);
     const element = actions?.elements?.[0];
     expect(element?.type).toBe("external_select");
@@ -607,7 +620,10 @@ describe("Slack native command argument menus", () => {
   });
 
   it("serves filtered options for external_select menus", async () => {
-    const { blockId } = await runCommandAndResolveActionsBlock(reportExternalHandler);
+    const { blockId } = await runCommandAndResolveActionsBlock(
+      reportExternalHandler,
+      harness.postEphemeral,
+    );
     expect(blockId).toContain("openclaw_cmdarg_ext:");
 
     const ackOptions = vi.fn().mockResolvedValue(undefined);
@@ -629,7 +645,10 @@ describe("Slack native command argument menus", () => {
   });
 
   it("rejects external_select option requests without user identity", async () => {
-    const { blockId } = await runCommandAndResolveActionsBlock(reportExternalHandler);
+    const { blockId } = await runCommandAndResolveActionsBlock(
+      reportExternalHandler,
+      harness.postEphemeral,
+    );
     expect(blockId).toContain("openclaw_cmdarg_ext:");
 
     const ackOptions = vi.fn().mockResolvedValue(undefined);

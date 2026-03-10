@@ -22,7 +22,6 @@ import {
   SLACK_EXTERNAL_ARG_MENU_PREFIX,
   type SlackExternalArgMenuChoice,
 } from "./external-arg-menu-store.js";
-import { escapeSlackMrkdwn } from "./mrkdwn.js";
 import { isSlackChannelAllowedByPolicy } from "./policy.js";
 import { resolveSlackRoomContextHints } from "./room-context.js";
 
@@ -74,17 +73,24 @@ function truncatePlainText(value: string, max: number): string {
 }
 
 function buildSlackArgMenuConfirm(params: { command: string; arg: string }) {
-  const command = escapeSlackMrkdwn(params.command);
-  const arg = escapeSlackMrkdwn(params.arg);
+  const command = truncatePlainText(params.command, 80);
+  const arg = truncatePlainText(params.arg, 80);
+  const text = truncatePlainText(`Run /${command} with ${arg} set to this value?`, 300);
   return {
     title: { type: "plain_text", text: "Confirm selection" },
-    text: {
-      type: "mrkdwn",
-      text: `Run */${command}* with *${arg}* set to this value?`,
-    },
+    text: { type: "plain_text", text },
     confirm: { type: "plain_text", text: "Run command" },
     deny: { type: "plain_text", text: "Cancel" },
   };
+}
+
+function resolveSlackMenuChoiceLabel(label: string, fallback: string): string {
+  const normalized = truncatePlainText(label, 75);
+  if (normalized) {
+    return normalized;
+  }
+  const fallbackLabel = truncatePlainText(fallback, 75);
+  return fallbackLabel || "option";
 }
 
 function storeSlackExternalArgMenu(params: {
@@ -227,23 +233,28 @@ function buildSlackCommandArgMenuBlocks(params: {
           },
         ]
       : encodedChoices.length <= SLACK_COMMAND_ARG_BUTTON_ROW_SIZE || !canUseStaticSelect
-        ? chunkItems(encodedChoices, SLACK_COMMAND_ARG_BUTTON_ROW_SIZE).map((choices) => ({
-            type: "actions",
-            elements: choices.map((choice) => ({
-              type: "button",
-              action_id: SLACK_COMMAND_ARG_ACTION_ID,
-              text: { type: "plain_text", text: choice.label },
-              value: choice.value,
-              confirm: buildSlackArgMenuConfirm({ command: params.command, arg: params.arg }),
-            })),
-          }))
+        ? chunkItems(encodedChoices, SLACK_COMMAND_ARG_BUTTON_ROW_SIZE).map(
+            (choices, rowIndex) => ({
+              type: "actions",
+              elements: choices.map((choice, choiceIndex) => ({
+                type: "button",
+                action_id: `${SLACK_COMMAND_ARG_ACTION_ID}_${rowIndex}_${choiceIndex}`,
+                text: {
+                  type: "plain_text",
+                  text: resolveSlackMenuChoiceLabel(choice.label, choice.value),
+                },
+                value: choice.value,
+                confirm: buildSlackArgMenuConfirm({ command: params.command, arg: params.arg }),
+              })),
+            }),
+          )
         : chunkItems(encodedChoices, SLACK_COMMAND_ARG_SELECT_OPTIONS_MAX).map(
             (choices, index) => ({
               type: "actions",
               elements: [
                 {
                   type: "static_select",
-                  action_id: SLACK_COMMAND_ARG_ACTION_ID,
+                  action_id: `${SLACK_COMMAND_ARG_ACTION_ID}_${index}`,
                   confirm: buildSlackArgMenuConfirm({ command: params.command, arg: params.arg }),
                   placeholder: {
                     type: "plain_text",
@@ -307,6 +318,9 @@ export async function registerSlackMonitorSlashCommands(params: {
     commandDefinition?: ChatCommandDefinition;
   }) => {
     const { command, ack, respond, body, prompt, commandArgs, commandDefinition } = p;
+    runtime.log?.(
+      `[DEBUG] Slash command received: command=${command.command}, text="${command.text}", user=${command.user_id}`,
+    );
     try {
       if (ctx.shouldDropMismatchedSlackEvent?.(body)) {
         await ack();
@@ -494,6 +508,9 @@ export async function registerSlackMonitorSlashCommands(params: {
           cfg,
         });
         if (menu) {
+          runtime.log?.(
+            `[DEBUG] Showing arg menu for command: ${commandDefinition.nativeName ?? commandDefinition.key}`,
+          );
           const commandLabel = commandDefinition.nativeName ?? commandDefinition.key;
           const title =
             menu.title ?? `Choose ${menu.arg.description || menu.arg.name} for /${commandLabel}.`;
@@ -507,11 +524,32 @@ export async function registerSlackMonitorSlashCommands(params: {
             createExternalMenuToken: (choices) =>
               storeSlackExternalArgMenu({ choices, userId: command.user_id }),
           });
-          await respond({
-            text: title,
-            blocks,
-            response_type: "ephemeral",
-          });
+          runtime.log?.(`[DEBUG] Blocks structure: ${JSON.stringify(blocks, null, 2)}`);
+          runtime.log?.(`[DEBUG] Attempting postEphemeral for command: ${commandLabel}`);
+          try {
+            await ctx.app.client.chat.postEphemeral({
+              token: ctx.botToken,
+              channel: command.channel_id,
+              user: command.user_id,
+              text: title,
+              blocks,
+            });
+            runtime.log?.(`[DEBUG] postEphemeral succeeded for command: ${commandLabel}`);
+          } catch (postErr) {
+            runtime.error?.(danger(`[DEBUG] postEphemeral with blocks failed: ${String(postErr)}`));
+            runtime.log?.(`[DEBUG] Falling back to respond() for command: ${commandLabel}`);
+            try {
+              await respond({
+                text: title,
+                blocks,
+                response_type: "ephemeral",
+              });
+              runtime.log?.(`[DEBUG] respond() succeeded for command: ${commandLabel}`);
+            } catch (respondErr) {
+              runtime.error?.(danger(`[DEBUG] respond() also failed: ${String(respondErr)}`));
+              throw respondErr;
+            }
+          }
           return;
         }
       }
@@ -628,6 +666,7 @@ export async function registerSlackMonitorSlashCommands(params: {
         });
       };
 
+      runtime.log?.(`[DEBUG] Dispatching command: ${command.command}, route: ${route.agentId}`);
       const { counts } = await dispatchReplyWithDispatcher({
         ctx: ctxPayload,
         cfg,
@@ -635,7 +674,9 @@ export async function registerSlackMonitorSlashCommands(params: {
           ...prefixOptions,
           deliver: async (payload) => deliverSlashPayloads([payload]),
           onError: (err, info) => {
-            runtime.error?.(danger(`slack slash ${info.kind} reply failed: ${String(err)}`));
+            runtime.error?.(
+              danger(`[DEBUG] slack slash ${info.kind} reply failed: ${String(err)}`),
+            );
           },
         },
         replyOptions: {
@@ -643,15 +684,50 @@ export async function registerSlackMonitorSlashCommands(params: {
           onModelSelected,
         },
       });
+      runtime.log?.(`[DEBUG] Command dispatched successfully, counts: ${JSON.stringify(counts)}`);
       if (counts.final + counts.tool + counts.block === 0) {
+        runtime.log?.(`[DEBUG] No replies to deliver`);
         await deliverSlashPayloads([]);
       }
     } catch (err) {
-      runtime.error?.(danger(`slack slash handler failed: ${String(err)}`));
-      await respond({
-        text: "Sorry, something went wrong handling that command.",
-        response_type: "ephemeral",
-      });
+      runtime.error?.(danger(`[DEBUG] slack slash handler failed: ${String(err)}`));
+      runtime.error?.(
+        danger(`[DEBUG] Error type: ${err instanceof Error ? err.constructor.name : typeof err}`),
+      );
+      if (err instanceof Error && err.stack) {
+        runtime.error?.(danger(`[DEBUG] Error stack: ${err.stack}`));
+      }
+      const errorText = "Sorry, something went wrong handling that command.";
+      runtime.log?.(`[DEBUG] Attempting to send error response via respond()`);
+      try {
+        await respond({
+          text: errorText,
+          response_type: "ephemeral",
+        });
+        runtime.log?.(`[DEBUG] Error response via respond() succeeded`);
+      } catch (respondErr) {
+        runtime.error?.(
+          danger(
+            `[DEBUG] slack slash error response via response_url failed: ${String(respondErr)}`,
+          ),
+        );
+        runtime.log?.(`[DEBUG] Attempting to send error response via postEphemeral`);
+        try {
+          await ctx.app.client.chat.postEphemeral({
+            token: ctx.botToken,
+            channel: command.channel_id,
+            user: command.user_id,
+            text: errorText,
+          });
+          runtime.log?.(`[DEBUG] Error response via postEphemeral succeeded`);
+        } catch (ephemeralErr) {
+          runtime.error?.(
+            danger(
+              `[DEBUG] slack slash error response via postEphemeral failed: ${String(ephemeralErr)}`,
+            ),
+          );
+        }
+      }
     }
   };
 
